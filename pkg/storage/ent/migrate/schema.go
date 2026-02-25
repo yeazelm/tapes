@@ -99,6 +99,11 @@ var (
 				Unique:  false,
 				Columns: []*schema.Column{NodesColumns[16]},
 			},
+			{
+				Name:    "node_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{NodesColumns[17]},
+			},
 		},
 	}
 	// Tables holds all the tables in the schema.

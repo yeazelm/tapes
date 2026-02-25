@@ -1611,7 +1611,7 @@ let facetPollTimer = null;
 
 const loadFacetInsights = async () => {
   if (facetPollTimer) {
-    clearInterval(facetPollTimer);
+    clearTimeout(facetPollTimer);
     facetPollTimer = null;
   }
 
@@ -1643,8 +1643,9 @@ const loadFacetInsights = async () => {
         progress.textContent = `analyzing sessions... ${status.done} of ${status.total}`;
         insightsGoalsEl.appendChild(progress);
 
-        // Poll for progress
-        facetPollTimer = setInterval(async () => {
+        // Poll for progress with exponential backoff
+        let facetPollInterval = 3000;
+        const pollFacetStatus = async () => {
           try {
             const pollStatus = await fetch("/api/facets/status");
             const pollData = await pollStatus.json();
@@ -1653,7 +1654,6 @@ const loadFacetInsights = async () => {
               progressEl.textContent = `analyzing sessions... ${pollData.done} of ${pollData.total}`;
             }
             if (pollData.done >= pollData.total) {
-              clearInterval(facetPollTimer);
               facetPollTimer = null;
               const sy = window.scrollY;
               const facetRes = await fetch("/api/facets");
@@ -1661,12 +1661,15 @@ const loadFacetInsights = async () => {
               facetsState = facetData;
               renderFacetInsights(facetData);
               requestAnimationFrame(() => window.scrollTo(0, sy));
+            } else {
+              facetPollInterval = Math.min(facetPollInterval * 1.5, 30000);
+              facetPollTimer = setTimeout(pollFacetStatus, facetPollInterval);
             }
           } catch {
-            clearInterval(facetPollTimer);
             facetPollTimer = null;
           }
-        }, 3000);
+        };
+        facetPollTimer = setTimeout(pollFacetStatus, facetPollInterval);
       }
     }
   } catch {

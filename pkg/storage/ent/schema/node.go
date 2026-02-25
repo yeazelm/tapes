@@ -137,6 +137,9 @@ func (Node) Indexes() []ent.Index {
 
 		// Index on project for filtering by project
 		index.Fields("project"),
+
+		// Index on created_at for time-range scans
+		index.Fields("created_at"),
 	}
 }
 
