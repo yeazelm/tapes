@@ -172,6 +172,14 @@ func (t *Tapes) BuildRelease(
 
 	// Git commit SHA of build
 	commit string,
+
+	// PostHog telemetry public API key (write-only). Empty disables telemetry.
+	// +optional
+	postHogPublicKey string,
+
+	// PostHog ingestion endpoint
+	// +optional
+	postHogEndpoint string,
 ) *dagger.Directory {
 	buildtime := time.Now()
 
@@ -181,6 +189,14 @@ func (t *Tapes) BuildRelease(
 		fmt.Sprintf("-X 'github.com/papercomputeco/tapes/pkg/utils.Version=%s'", version),
 		fmt.Sprintf("-X 'github.com/papercomputeco/tapes/pkg/utils.Sha=%s'", commit),
 		fmt.Sprintf("-X 'github.com/papercomputeco/tapes/pkg/utils.Buildtime=%s'", buildtime),
+	}
+
+	if postHogPublicKey != "" {
+		ldflags = append(ldflags, fmt.Sprintf("-X 'github.com/papercomputeco/tapes/pkg/telemetry.PostHogAPIKey=%s'", postHogPublicKey))
+	}
+
+	if postHogEndpoint != "" {
+		ldflags = append(ldflags, fmt.Sprintf("-X 'github.com/papercomputeco/tapes/pkg/telemetry.PostHogEndpoint=%s'", postHogEndpoint))
 	}
 
 	dir := t.Build(ctx, strings.Join(ldflags, " "))

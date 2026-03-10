@@ -2,6 +2,8 @@
 package tapescmder
 
 import (
+	"log/slog"
+
 	"github.com/spf13/cobra"
 
 	authcmder "github.com/papercomputeco/tapes/cmd/tapes/auth"
@@ -19,6 +21,9 @@ import (
 	statuscmder "github.com/papercomputeco/tapes/cmd/tapes/status"
 	synccmder "github.com/papercomputeco/tapes/cmd/tapes/sync"
 	versioncmder "github.com/papercomputeco/tapes/cmd/version"
+	"github.com/papercomputeco/tapes/pkg/config"
+	"github.com/papercomputeco/tapes/pkg/logger"
+	"github.com/papercomputeco/tapes/pkg/telemetry"
 )
 
 const tapesLongDesc string = `Tapes is automatic telemetry for your agents.
@@ -53,16 +58,28 @@ Search sessions:
 
 const tapesShortDesc string = "Tapes - Agent Telemetry"
 
+// tapesFlags defines flags registered on the root tapes command.
+var tapesFlags = config.FlagSet{
+	config.FlagTelemetryDisabled: {
+		Name:        "disable-telemetry",
+		ViperKey:    "telemetry.disabled",
+		Description: "Disable anonymous usage telemetry",
+	},
+}
+
 func NewTapesCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "tapes",
-		Short: tapesShortDesc,
-		Long:  tapesLongDesc,
+		Use:                "tapes",
+		Short:              tapesShortDesc,
+		Long:               tapesLongDesc,
+		PersistentPreRunE:  initTelemetry,
+		PersistentPostRunE: closeTelemetry,
 	}
 
 	// Global flags
 	cmd.PersistentFlags().BoolP("debug", "d", false, "Enable debug logging")
 	cmd.PersistentFlags().String("config-dir", "", "Override path to .tapes/ config directory")
+	cmd.PersistentFlags().Bool("disable-telemetry", false, "Disable anonymous usage telemetry")
 
 	// Add subcommands
 	cmd.AddCommand(synccmder.NewSyncCmd())
@@ -82,4 +99,86 @@ func NewTapesCmd() *cobra.Command {
 	cmd.AddCommand(versioncmder.NewVersionCmd())
 
 	return cmd
+}
+
+// initTelemetry initializes anonymous telemetry and stores the client in the
+// command context. Telemetry is silently skipped when disabled via config,
+// flag, env var, or CI detection — errors during init never block command
+// execution. Viper handles the flag > env > config file precedence for the
+// telemetry.disabled setting.
+func initTelemetry(cmd *cobra.Command, _ []string) error {
+	initTelemLogger := logger.New(logger.WithDebug(true), logger.WithPretty(true))
+	configDir, _ := cmd.Flags().GetString("config-dir")
+
+	v, err := config.InitViper(configDir)
+	if err != nil {
+		initTelemLogger.Warn("Could not initiate telemetry, continuing", "error", err)
+		return nil
+	}
+
+	config.BindRegisteredFlags(v, cmd, tapesFlags, []string{
+		config.FlagTelemetryDisabled,
+	})
+
+	// Single check covers --disable-telemetry flag, TAPES_TELEMETRY_DISABLED
+	// env var, and config.toml [telemetry] disabled setting.
+	if v.GetBool("telemetry.disabled") {
+		return nil
+	}
+
+	// Check CI environment.
+	if telemetry.IsCI() {
+		return nil
+	}
+
+	client, isFirstRun := newTelemetryClient(configDir, initTelemLogger)
+	if client == nil {
+		return nil
+	}
+
+	if isFirstRun {
+		client.CaptureInstall()
+	}
+
+	// Capture the command run event now so it is enqueued even if
+	// PersistentPostRunE is skipped due to a command error.
+	client.CaptureCommandRun(cmd.CommandPath())
+
+	cmd.SetContext(telemetry.WithContext(cmd.Context(), client))
+
+	return nil
+}
+
+// newTelemetryClient creates the PostHog telemetry client and loads or creates
+// the persistent identity. Returns (nil, false) if any step fails — telemetry
+// setup errors are intentionally non-fatal.
+func newTelemetryClient(configDir string, l *slog.Logger) (client *telemetry.Client, isFirstRun bool) {
+	mgr, err := telemetry.NewManager(configDir)
+	if err != nil {
+		return nil, false
+	}
+
+	state, isFirstRun, err := mgr.LoadOrCreate()
+	if err != nil {
+		return nil, false
+	}
+
+	client, err = telemetry.NewClient(state.UUID, l)
+	if err != nil {
+		return nil, false
+	}
+
+	return client, isFirstRun
+}
+
+// closeTelemetry flushes pending events and shuts down the PostHog client.
+func closeTelemetry(cmd *cobra.Command, _ []string) error {
+	client := telemetry.FromContext(cmd.Context())
+	if client == nil {
+		return nil
+	}
+
+	_ = client.Close()
+
+	return nil
 }
