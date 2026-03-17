@@ -19,7 +19,7 @@ const seedLongDesc string = `Seed demo data into a SQLite database.
 Examples:
   tapes seed
   tapes seed --demo
-  tapes seed --sqlite ./tapes.db
+  tapes seed --sqlite ./tapes.sqlite
   tapes seed --overwrite`
 
 const seedShortDesc string = "Seed demo sessions"
@@ -80,10 +80,5 @@ func (c *seedCommander) resolveSQLitePath() string {
 		return deck.DemoSQLitePath
 	}
 
-	path, err := sqlitepath.ResolveSQLitePath("")
-	if err == nil {
-		return path
-	}
-
-	return "tapes.db"
+	return sqlitepath.ResolveSQLitePathWithFallback("")
 }

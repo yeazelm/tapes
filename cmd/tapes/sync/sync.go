@@ -91,12 +91,7 @@ func (c *syncCommander) resolveSQLitePath() string {
 		return c.sqlitePath
 	}
 
-	path, err := sqlitepath.ResolveSQLitePath("")
-	if err == nil {
-		return path
-	}
-
-	return "tapes.db"
+	return sqlitepath.ResolveSQLitePathWithFallback("")
 }
 
 func (c *syncCommander) resolveClaudeDir() string {
