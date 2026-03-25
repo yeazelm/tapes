@@ -64,14 +64,16 @@ Examples:
 )
 
 type startCommander struct {
-	debug       bool
-	configDir   string
-	logs        bool
-	daemon      bool
-	provider    string
-	model       string
-	project     string
-	postgresDSN string
+	debug         bool
+	configDir     string
+	logs          bool
+	daemon        bool
+	provider      string
+	model         string
+	project       string
+	postgresDSN   string
+	daemonTimeout time.Duration   // timeout for waitForDaemon; 0 means 30s default
+	daemonDone    <-chan struct{} // closed when daemon child process exits; nil if not tracking
 }
 
 type startConfig struct {
@@ -393,17 +395,9 @@ func (c *startCommander) runServices(ctx context.Context, manager *start.Manager
 	proxyURL := "http://" + proxyListener.Addr().String()
 	apiURL := "http://" + apiListener.Addr().String()
 
-	state := &start.State{
-		DaemonPID:        os.Getpid(),
-		ProxyURL:         proxyURL,
-		APIURL:           apiURL,
-		ShutdownWhenIdle: shutdownWhenIdle,
-		LogPath:          manager.LogPath,
-	}
-	if err := manager.SaveState(state); err != nil {
-		return err
-	}
-
+	// Release the lock after binding listeners. We only needed exclusive access
+	// to prevent duplicate daemon spawns. The defer on lock.Release is kept as
+	// a safety net (double-release is safe).
 	if err := lock.Release(); err != nil {
 		return err
 	}
@@ -485,6 +479,22 @@ func (c *startCommander) runServices(ctx context.Context, manager *start.Manager
 			errChan <- fmt.Errorf("api error: %w", err)
 		}
 	}()
+
+	// Write state AFTER server goroutines are launched — this is the fix for PCC-281.
+	// The listeners are already bound (ports allocated), so the kernel TCP backlog
+	// accepts incoming connections even before the goroutines call Accept(). This
+	// means /ping requests from waitForDaemon will queue and be served once the
+	// event loop starts, rather than getting "connection refused."
+	state := &start.State{
+		DaemonPID:        os.Getpid(),
+		ProxyURL:         proxyURL,
+		APIURL:           apiURL,
+		ShutdownWhenIdle: shutdownWhenIdle,
+		LogPath:          manager.LogPath,
+	}
+	if err := manager.SaveState(state); err != nil {
+		return err
+	}
 
 	if shutdownWhenIdle {
 		go c.monitorIdle(manager, log, errChan)
@@ -597,21 +607,40 @@ func (c *startCommander) spawnDaemon(ctx context.Context, manager *start.Manager
 		_ = logFile.Close()
 		return fmt.Errorf("starting daemon: %w", err)
 	}
+
+	done := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
+		close(done)
 	}()
+	c.daemonDone = done
+
 	return logFile.Close()
 }
 
 func (c *startCommander) waitForDaemon(ctx context.Context, manager *start.Manager) (*start.State, error) {
-	deadline := time.After(15 * time.Second)
+	timeout := c.daemonTimeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.After(timeout)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-deadline:
-			return nil, errors.New("timed out waiting for daemon")
+			return nil, errors.New("timed out waiting for daemon: the daemon process did not become healthy within 30 seconds; check logs with 'tapes start --logs'")
 		default:
+		}
+
+		// Channel-based crash detection: if the daemon child exited, fail fast
+		// instead of polling until timeout.
+		if c.daemonDone != nil {
+			select {
+			case <-c.daemonDone:
+				return nil, errors.New("daemon process exited during startup; check logs with 'tapes start --logs'")
+			default:
+			}
 		}
 
 		lock, err := manager.Lock()
