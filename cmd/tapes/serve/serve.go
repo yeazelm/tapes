@@ -15,7 +15,9 @@ import (
 
 	"github.com/papercomputeco/tapes/api"
 	apicmder "github.com/papercomputeco/tapes/cmd/tapes/serve/api"
+	ingestcmder "github.com/papercomputeco/tapes/cmd/tapes/serve/ingest"
 	proxycmder "github.com/papercomputeco/tapes/cmd/tapes/serve/proxy"
+	"github.com/papercomputeco/tapes/ingest"
 	"github.com/papercomputeco/tapes/pkg/config"
 	"github.com/papercomputeco/tapes/pkg/dotdir"
 	embeddingutils "github.com/papercomputeco/tapes/pkg/embeddings/utils"
@@ -34,13 +36,14 @@ import (
 type ServeCommander struct {
 	flags config.FlagSet
 
-	proxyListen string
-	apiListen   string
-	upstream    string
-	debug       bool
-	sqlitePath  string
-	postgresDSN string
-	project     string
+	proxyListen  string
+	apiListen    string
+	ingestListen string
+	upstream     string
+	debug        bool
+	sqlitePath   string
+	postgresDSN  string
+	project      string
 
 	providerType string
 
@@ -59,6 +62,7 @@ type ServeCommander struct {
 var ServeFlags = config.FlagSet{
 	config.FlagProxyListen:     {Name: "proxy-listen", Shorthand: "p", ViperKey: "proxy.listen", Description: "Address for proxy to listen on"},
 	config.FlagAPIListen:       {Name: "api-listen", Shorthand: "a", ViperKey: "api.listen", Description: "Address for API server to listen on"},
+	config.FlagIngestListen:    {Name: "ingest-listen", Shorthand: "i", ViperKey: "ingest.listen", Description: "Address for ingest server to listen on (sidecar mode)"},
 	config.FlagUpstream:        {Name: "upstream", Shorthand: "u", ViperKey: "proxy.upstream", Description: "Upstream LLM provider URL"},
 	config.FlagProvider:        {Name: "provider", ViperKey: "proxy.provider", Description: "LLM provider type (anthropic, openai, ollama)"},
 	config.FlagSQLite:          {Name: "sqlite", Shorthand: "s", ViperKey: "storage.sqlite_path", Description: "Path to SQLite database"},
@@ -75,9 +79,10 @@ var ServeFlags = config.FlagSet{
 const serveLongDesc string = `Run Tapes services.
 
 Use subcommands to run individual services or all services together:
-  tapes serve          Run both proxy and API server together
-  tapes serve api      Run just the API server
-  tapes serve proxy    Run just the proxy server
+  tapes serve            Run proxy and API server together
+  tapes serve api        Run just the API server
+  tapes serve proxy      Run just the proxy server
+  tapes serve ingest     Run just the ingest server (sidecar mode)
 
 Optionally configure vector storage and embeddings of text content for "tapes search"
 agentic functionality.`
@@ -103,6 +108,7 @@ func NewServeCmd() *cobra.Command {
 			config.BindRegisteredFlags(v, cmd, cmder.flags, []string{
 				config.FlagProxyListen,
 				config.FlagAPIListen,
+				config.FlagIngestListen,
 				config.FlagUpstream,
 				config.FlagProvider,
 				config.FlagSQLite,
@@ -144,6 +150,7 @@ func NewServeCmd() *cobra.Command {
 			cmder.postgresDSN = v.GetString("storage.postgres_dsn")
 			cmder.proxyListen = v.GetString("proxy.listen")
 			cmder.apiListen = v.GetString("api.listen")
+			cmder.ingestListen = v.GetString("ingest.listen")
 			cmder.upstream = v.GetString("proxy.upstream")
 			cmder.providerType = v.GetString("proxy.provider")
 			cmder.sqlitePath = v.GetString("storage.sqlite_path")
@@ -174,6 +181,7 @@ func NewServeCmd() *cobra.Command {
 
 	config.AddStringFlag(cmd, cmder.flags, config.FlagProxyListen, &cmder.proxyListen)
 	config.AddStringFlag(cmd, cmder.flags, config.FlagAPIListen, &cmder.apiListen)
+	config.AddStringFlag(cmd, cmder.flags, config.FlagIngestListen, &cmder.ingestListen)
 	config.AddStringFlag(cmd, cmder.flags, config.FlagUpstream, &cmder.upstream)
 	config.AddStringFlag(cmd, cmder.flags, config.FlagProvider, &cmder.providerType)
 	config.AddStringFlag(cmd, cmder.flags, config.FlagSQLite, &cmder.sqlitePath)
@@ -187,6 +195,7 @@ func NewServeCmd() *cobra.Command {
 	config.AddStringFlag(cmd, cmder.flags, config.FlagPostgres, &cmder.postgresDSN)
 
 	cmd.AddCommand(apicmder.NewAPICmd())
+	cmd.AddCommand(ingestcmder.NewIngestCmd())
 	cmd.AddCommand(proxycmder.NewProxyCmd())
 
 	return cmd
@@ -276,8 +285,25 @@ func (c *ServeCommander) run() error {
 		"api_addr", c.apiListen,
 	)
 
+	// Optionally create ingest server for sidecar mode
+	ingestConfig := ingest.Config{
+		ListenAddr:   c.ingestListen,
+		VectorDriver: proxyConfig.VectorDriver,
+		Embedder:     proxyConfig.Embedder,
+		Project:      c.project,
+	}
+	ingestServer, err := ingest.New(ingestConfig, driver, c.logger)
+	if err != nil {
+		return fmt.Errorf("creating ingest server: %w", err)
+	}
+	defer ingestServer.Close()
+
+	c.logger.Info("starting ingest server",
+		"ingest_addr", c.ingestListen,
+	)
+
 	// Channel to capture errors from goroutines
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 3)
 
 	// Start proxy in goroutine
 	go func() {
@@ -290,6 +316,12 @@ func (c *ServeCommander) run() error {
 	go func() {
 		if err := apiServer.Run(); err != nil {
 			errChan <- fmt.Errorf("API server error: %w", err)
+		}
+	}()
+
+	go func() {
+		if err := ingestServer.Run(); err != nil {
+			errChan <- fmt.Errorf("ingest server error: %w", err)
 		}
 	}()
 
