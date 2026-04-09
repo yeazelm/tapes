@@ -41,6 +41,16 @@ type SessionSummary struct {
 	ToolCalls    int           `json:"tool_calls"`
 	MessageCount int           `json:"message_count"`
 	SessionCount int           `json:"session_count,omitempty"`
+
+	// Truncated is true when this summary was built from a partial chain
+	// because an ancestor's parent_hash could not be resolved in the
+	// current store. MissingParent names the hash that would have
+	// continued the walk if the referenced node existed. Both fields are
+	// informational — they signal that higher ancestors may live outside
+	// this store (trimmed history, foreign chain, offloaded data) rather
+	// than an error.
+	Truncated     bool   `json:"truncated,omitempty"`
+	MissingParent string `json:"missing_parent,omitempty"`
 }
 
 // ModelCost is a per-model aggregate of cost and token usage within a session

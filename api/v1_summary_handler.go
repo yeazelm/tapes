@@ -34,9 +34,11 @@ func (s *Server) handleListSessionsSummary(c *fiber.Ctx) error {
 
 	items := make([]sessions.SessionSummary, 0, len(page.Items))
 	for _, leaf := range page.Items {
-		// Ancestry returns node-first, so we need to reverse for
-		// chronological order before calling BuildSummary.
-		ancestry, err := s.driver.Ancestry(c.Context(), leaf.Hash)
+		// AncestryChain returns node-first and carries a marker when the
+		// walk stopped at a parent that's missing from this store. We
+		// reverse for chronological order before calling BuildSummary
+		// and then stamp the marker onto the returned summary.
+		chain, err := s.driver.AncestryChain(c.Context(), leaf.Hash)
 		if err != nil {
 			s.logger.Warn("failed to walk ancestry for summary",
 				"hash", leaf.Hash,
@@ -44,15 +46,19 @@ func (s *Server) handleListSessionsSummary(c *fiber.Ctx) error {
 			)
 			continue
 		}
-		chain := reverseNodes(ancestry)
+		chronological := reverseNodes(chain.Nodes)
 
-		summary, _, _, err := sessions.BuildSummary(chain, pricing)
+		summary, _, _, err := sessions.BuildSummary(chronological, pricing)
 		if err != nil {
 			s.logger.Warn("failed to build summary",
 				"hash", leaf.Hash,
 				"error", err,
 			)
 			continue
+		}
+		if chain.Incomplete {
+			summary.Truncated = true
+			summary.MissingParent = chain.MissingParent
 		}
 		items = append(items, summary)
 	}

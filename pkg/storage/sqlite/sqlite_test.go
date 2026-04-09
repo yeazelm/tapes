@@ -2,8 +2,10 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -16,6 +18,14 @@ import (
 )
 
 var _ = storagetest.RunListSessionsSpecs("sqlite", func() storage.Driver {
+	ctx := context.Background()
+	d, err := sqlite.NewDriver(ctx, ":memory:")
+	Expect(err).NotTo(HaveOccurred())
+	Expect(d.Migrate(ctx)).To(Succeed())
+	return d
+})
+
+var _ = storagetest.RunAncestryChainBasicSpecs("sqlite", func() storage.Driver {
 	ctx := context.Background()
 	d, err := sqlite.NewDriver(ctx, ":memory:")
 	Expect(err).NotTo(HaveOccurred())
@@ -490,5 +500,91 @@ var _ = Describe("Driver", func() {
 			leaves, _ := driver.Leaves(ctx)
 			Expect(leaves).To(HaveLen(2))
 		})
+	})
+})
+
+var _ = Describe("AncestryChain dangling parents [sqlite]", func() {
+	var (
+		ctx     context.Context
+		driver  *sqlite.Driver
+		rawDB   *sql.DB
+		dbPath  string
+		tempDir string
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+
+		var err error
+		tempDir, err = os.MkdirTemp("", "sqlite-dangling-*")
+		Expect(err).NotTo(HaveOccurred())
+		dbPath = filepath.Join(tempDir, "dangling.sqlite")
+
+		driver, err = sqlite.NewDriver(ctx, dbPath)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(driver.Migrate(ctx)).To(Succeed())
+
+		// Separate FK-disabled handle used only for the raw orphan insert.
+		rawDB, err = sql.Open("sqlite3", dbPath+"?_foreign_keys=off")
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		if rawDB != nil {
+			_ = rawDB.Close()
+		}
+		if driver != nil {
+			_ = driver.Close()
+		}
+		_ = os.RemoveAll(tempDir)
+	})
+
+	insertOrphan := func(hash, parentHash string) {
+		now := time.Now().UTC()
+		_, err := rawDB.ExecContext(ctx,
+			`INSERT INTO nodes (hash, parent_hash, bucket, type, role, created_at)
+			 VALUES (?, ?, '{"type":"message","role":"user"}', 'message', 'user', ?)`,
+			hash, parentHash, now)
+		Expect(err).NotTo(HaveOccurred())
+	}
+
+	It("marks the chain incomplete when a parent_hash is missing", func() {
+		phantom := "0000000000000000000000000000000000000000000000000000000000000000"
+		orphanHash := "aaaa000000000000000000000000000000000000000000000000000000000000"
+		childHash := "bbbb000000000000000000000000000000000000000000000000000000000000"
+
+		insertOrphan(orphanHash, phantom)
+		insertOrphan(childHash, orphanHash)
+
+		chain, err := driver.AncestryChain(ctx, childHash)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chain.Nodes).To(HaveLen(2))
+		Expect(chain.Incomplete).To(BeTrue())
+		Expect(chain.MissingParent).To(Equal(phantom))
+		Expect(chain.Complete()).To(BeFalse())
+		Expect(chain.Nodes[0].Hash).To(Equal(childHash))
+		Expect(chain.Nodes[1].Hash).To(Equal(orphanHash))
+	})
+
+	It("marks a single orphan node incomplete without returning an error", func() {
+		phantom := "1111111111111111111111111111111111111111111111111111111111111111"
+		orphanHash := "cccc000000000000000000000000000000000000000000000000000000000000"
+		insertOrphan(orphanHash, phantom)
+
+		chain, err := driver.AncestryChain(ctx, orphanHash)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chain.Nodes).To(HaveLen(1))
+		Expect(chain.Incomplete).To(BeTrue())
+		Expect(chain.MissingParent).To(Equal(phantom))
+	})
+
+	It("leaves Ancestry behavior compatible with callers that ignore the marker", func() {
+		phantom := "2222222222222222222222222222222222222222222222222222222222222222"
+		orphanHash := "dddd000000000000000000000000000000000000000000000000000000000000"
+		insertOrphan(orphanHash, phantom)
+
+		nodes, err := driver.Ancestry(ctx, orphanHash)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes).To(HaveLen(1))
 	})
 })

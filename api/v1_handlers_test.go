@@ -225,6 +225,48 @@ var _ = Describe("v1 session handlers", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.StatusCode).To(Equal(fiber.StatusBadRequest))
 		})
+
+		Context("when an ancestor's parent is missing from the store", func() {
+			var (
+				phantomParent string
+				orphan        *merkle.Node
+				orphanChild   *merkle.Node
+			)
+
+			BeforeEach(func() {
+				// Build a chain whose root points at a parent that
+				// was never inserted. The inmemory driver has no FK
+				// enforcement so this simulates the production
+				// dangling shape directly.
+				phantomParent = "ffff000000000000000000000000000000000000000000000000000000000000"
+				orphanBucket := v1TestBucket("user", "orphan turn", "m", "p", "claude")
+				orphan = merkle.NewNode(orphanBucket, &merkle.Node{Hash: phantomParent}, merkle.NodeOptions{Project: "tapes"})
+				Expect(putNode(ctx, inMem, orphan)).To(Succeed())
+
+				orphanChild = merkle.NewNode(v1TestBucket("assistant", "answer", "m", "p", "claude"), orphan, merkle.NodeOptions{Project: "tapes"})
+				Expect(putNode(ctx, inMem, orphanChild)).To(Succeed())
+			})
+
+			It("marks the detail response truncated and names the missing parent", func() {
+				body := decodeSession(server, "/v1/sessions/"+orphanChild.Hash)
+				Expect(body.Truncated).To(BeTrue())
+				Expect(body.MissingParent).To(Equal(phantomParent))
+				// The two resolvable nodes still come back in
+				// chronological order.
+				Expect(body.Turns).To(HaveLen(2))
+				Expect(body.Turns[0].Hash).To(Equal(orphan.Hash))
+				Expect(body.Turns[1].Hash).To(Equal(orphanChild.Hash))
+			})
+
+			It("leaves clean sessions with no truncation marker", func() {
+				// The outer BeforeEach built leaf with a real root,
+				// so it must round-trip clean even while a dangling
+				// chain also lives in the same store.
+				body := decodeSession(server, "/v1/sessions/"+leaf.Hash)
+				Expect(body.Truncated).To(BeFalse())
+				Expect(body.MissingParent).To(BeEmpty())
+			})
+		})
 	})
 
 	Describe("GET /v1/stats", func() {

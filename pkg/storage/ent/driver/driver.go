@@ -189,8 +189,23 @@ func (ed *EntDriver) Leaves(ctx context.Context) ([]*merkle.Node, error) {
 }
 
 // Ancestry returns the path from a node back to its root (node first, root last).
-// Uses the parent edge for traversal.
+// Uses the parent edge for traversal. See AncestryChain for a variant that
+// also signals when the walk stopped at a missing parent.
 func (ed *EntDriver) Ancestry(ctx context.Context, hash string) ([]*merkle.Node, error) {
+	chain, err := ed.AncestryChain(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	return chain.Nodes, nil
+}
+
+// AncestryChain walks the parent chain starting at hash and returns a Chain
+// describing whether the walk reached a real root or stopped at a parent
+// that is not present in this store. A missing parent is treated as an
+// expected edge case (e.g. trimmed history, foreign chain, offloaded data)
+// and surfaced via Chain.Incomplete / Chain.MissingParent rather than as an
+// error.
+func (ed *EntDriver) AncestryChain(ctx context.Context, hash string) (*storage.Chain, error) {
 	var path []*merkle.Node
 
 	current, err := ed.Client.Node.Get(ctx, hash)
@@ -201,6 +216,7 @@ func (ed *EntDriver) Ancestry(ctx context.Context, hash string) ([]*merkle.Node,
 		return nil, fmt.Errorf("failed to get node: %w", err)
 	}
 
+	chain := &storage.Chain{}
 	for current != nil {
 		n, err := ed.entNodeToMerkleNode(current)
 		if err != nil {
@@ -208,10 +224,15 @@ func (ed *EntDriver) Ancestry(ctx context.Context, hash string) ([]*merkle.Node,
 		}
 		path = append(path, n)
 
-		// Use the parent edge to traverse up
 		parent, err := current.QueryParent().Only(ctx)
 		if ent.IsNotFound(err) {
-			break // Reached root
+			// Distinguish a real root (no parent_hash) from a dangling
+			// pointer (parent_hash set but referenced node missing).
+			if current.ParentHash != nil && *current.ParentHash != "" {
+				chain.Incomplete = true
+				chain.MissingParent = *current.ParentHash
+			}
+			break
 		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to query parent: %w", err)
@@ -219,7 +240,8 @@ func (ed *EntDriver) Ancestry(ctx context.Context, hash string) ([]*merkle.Node,
 		current = parent
 	}
 
-	return path, nil
+	chain.Nodes = path
+	return chain, nil
 }
 
 // Depth returns the depth of a node (0 for roots).

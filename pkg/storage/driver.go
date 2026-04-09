@@ -49,6 +49,14 @@ type Driver interface {
 	// the filter in opts. Pagination fields on opts (Limit, Cursor) are ignored.
 	CountSessions(ctx context.Context, opts ListOpts) (SessionStats, error)
 
+	// AncestryChain is Ancestry with a marker describing how the walk
+	// terminated. When the walk stops at a parent_hash whose target is not
+	// present in this store, the returned Chain has Incomplete=true and
+	// MissingParent set to that parent_hash. The nodes in Chain.Nodes are
+	// still valid; this state is expected on stores that trim older data or
+	// merge content from foreign sources, and is not an error.
+	AncestryChain(ctx context.Context, hash string) (*Chain, error)
+
 	// Depth returns the depth of a node (0 for roots).
 	Depth(ctx context.Context, hash string) (int, error)
 

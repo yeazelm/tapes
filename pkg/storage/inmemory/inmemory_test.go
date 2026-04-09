@@ -9,3 +9,11 @@ import (
 var _ = storagetest.RunListSessionsSpecs("inmemory", func() storage.Driver {
 	return inmemory.NewDriver()
 })
+
+var _ = storagetest.RunAncestryChainBasicSpecs("inmemory", func() storage.Driver {
+	return inmemory.NewDriver()
+})
+
+var _ = storagetest.RunAncestryChainDanglingSpecs("inmemory", func() storage.Driver {
+	return inmemory.NewDriver()
+})

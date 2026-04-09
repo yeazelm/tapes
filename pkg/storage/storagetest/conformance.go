@@ -204,9 +204,126 @@ func makeNode(id string, parentHash *string, createdAt time.Time, project, agent
 		// Synthesise a stand-in parent so NewNode can hash with the right link.
 		parent = &merkle.Node{Hash: *parentHash}
 	}
-	n := merkle.NewNode(bucket, parent, merkle.NodeMeta{Project: project})
+	n := merkle.NewNode(bucket, parent, merkle.NodeOptions{Project: project})
 	n.CreatedAt = createdAt
 	return n
+}
+
+// RunAncestryChainBasicSpecs registers Describe blocks exercising the paths
+// of AncestryChain that don't require injecting an orphan: complete walks,
+// single-root chains, and NotFound on a missing starting hash. These run
+// against every driver regardless of whether it can bypass referential
+// integrity to create a dangling parent.
+func RunAncestryChainBasicSpecs(label string, makeDriver DriverFactory) bool {
+	return ginkgo.Describe("AncestryChain basics ["+label+"]", func() {
+		var (
+			ctx    context.Context
+			driver storage.Driver
+		)
+
+		ginkgo.BeforeEach(func() {
+			ctx = context.Background()
+			driver = makeDriver()
+		})
+
+		ginkgo.AfterEach(func() {
+			if driver != nil {
+				_ = driver.Close()
+			}
+		})
+
+		base := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+		ginkgo.It("returns a complete chain when the walk reaches a real root", func() {
+			root := makeNode("root", nil, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, root)
+			mid := makeNode("mid", &root.Hash, base.Add(time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, mid)
+			leaf := makeNode("leaf", &mid.Hash, base.Add(2*time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, leaf)
+
+			chain, err := driver.AncestryChain(ctx, leaf.Hash)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chain.Nodes).To(gomega.HaveLen(3))
+			gomega.Expect(chain.Incomplete).To(gomega.BeFalse())
+			gomega.Expect(chain.MissingParent).To(gomega.BeEmpty())
+			gomega.Expect(chain.Complete()).To(gomega.BeTrue())
+			// Node-first order.
+			gomega.Expect(chain.Nodes[0].Hash).To(gomega.Equal(leaf.Hash))
+			gomega.Expect(chain.Nodes[2].Hash).To(gomega.Equal(root.Hash))
+		})
+
+		ginkgo.It("returns a single-node chain for a root with no parent", func() {
+			root := makeNode("root", nil, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, root)
+
+			chain, err := driver.AncestryChain(ctx, root.Hash)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chain.Nodes).To(gomega.HaveLen(1))
+			gomega.Expect(chain.Incomplete).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("returns an error when the starting hash itself is missing", func() {
+			_, err := driver.AncestryChain(ctx, "does-not-exist")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+	})
+}
+
+// RunAncestryChainDanglingSpecs exercises the dangling-parent path of
+// AncestryChain. Only drivers without enforced referential integrity (i.e.
+// the in-memory driver) can accept an orphan via Put — the sqlite driver
+// has a foreign-key constraint that rejects them. Drivers with FK enforcement
+// must inject orphans by bypassing Put and should register these specs
+// manually from their own test file with a dedicated setup.
+func RunAncestryChainDanglingSpecs(label string, makeDriver DriverFactory) bool {
+	return ginkgo.Describe("AncestryChain dangling parents ["+label+"]", func() {
+		var (
+			ctx    context.Context
+			driver storage.Driver
+		)
+
+		ginkgo.BeforeEach(func() {
+			ctx = context.Background()
+			driver = makeDriver()
+		})
+
+		ginkgo.AfterEach(func() {
+			if driver != nil {
+				_ = driver.Close()
+			}
+		})
+
+		base := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+		ginkgo.It("marks the chain incomplete when a parent_hash is missing", func() {
+			phantom := "0000000000000000000000000000000000000000000000000000000000000000"
+			orphan := makeNode("orphan", &phantom, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, orphan)
+			child := makeNode("child", &orphan.Hash, base.Add(time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, child)
+
+			chain, err := driver.AncestryChain(ctx, child.Hash)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chain.Nodes).To(gomega.HaveLen(2))
+			gomega.Expect(chain.Incomplete).To(gomega.BeTrue())
+			gomega.Expect(chain.MissingParent).To(gomega.Equal(phantom))
+			gomega.Expect(chain.Complete()).To(gomega.BeFalse())
+			gomega.Expect(chain.Nodes[1].Hash).To(gomega.Equal(orphan.Hash))
+		})
+
+		ginkgo.It("marks a single orphan node incomplete without returning an error", func() {
+			phantom := "1111111111111111111111111111111111111111111111111111111111111111"
+			orphan := makeNode("solo-orphan", &phantom, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, orphan)
+
+			chain, err := driver.AncestryChain(ctx, orphan.Hash)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chain.Nodes).To(gomega.HaveLen(1))
+			gomega.Expect(chain.Incomplete).To(gomega.BeTrue())
+			gomega.Expect(chain.MissingParent).To(gomega.Equal(phantom))
+		})
+	})
 }
 
 func putWith(ctx context.Context, d storage.Driver, n *merkle.Node) {

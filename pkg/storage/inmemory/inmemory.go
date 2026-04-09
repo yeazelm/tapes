@@ -142,24 +142,45 @@ func (s *Driver) Leaves(_ context.Context) ([]*merkle.Node, error) {
 }
 
 // Ancestry returns the path from a node back to its root (node first, root last).
+// See AncestryChain for a variant that also signals when the walk stopped at
+// a missing parent.
 func (s *Driver) Ancestry(ctx context.Context, hash string) ([]*merkle.Node, error) {
-	var path []*merkle.Node
-	current := hash
+	chain, err := s.AncestryChain(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	return chain.Nodes, nil
+}
 
-	for {
-		node, err := s.Get(ctx, current)
-		if err != nil {
-			return nil, fmt.Errorf("getting node %s: %w", current, err)
-		}
-		path = append(path, node)
-
-		if node.ParentHash == nil {
-			break
-		}
-		current = *node.ParentHash
+// AncestryChain walks the parent chain starting at hash and returns a Chain
+// describing whether the walk reached a real root or stopped at a parent
+// that is not present in this store.
+func (s *Driver) AncestryChain(ctx context.Context, hash string) (*storage.Chain, error) {
+	node, err := s.Get(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("getting node %s: %w", hash, err)
 	}
 
-	return path, nil
+	chain := &storage.Chain{Nodes: []*merkle.Node{node}}
+	for {
+		if node.ParentHash == nil || *node.ParentHash == "" {
+			return chain, nil
+		}
+		parent, err := s.Get(ctx, *node.ParentHash)
+		if err != nil {
+			var notFound storage.NotFoundError
+			if errors.As(err, &notFound) {
+				// Parent pointer exists but the target is missing —
+				// treat as an expected partial-chain condition.
+				chain.Incomplete = true
+				chain.MissingParent = *node.ParentHash
+				return chain, nil
+			}
+			return nil, fmt.Errorf("getting node %s: %w", *node.ParentHash, err)
+		}
+		chain.Nodes = append(chain.Nodes, parent)
+		node = parent
+	}
 }
 
 // Depth returns the depth of a node (0 for roots).

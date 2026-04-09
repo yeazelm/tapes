@@ -62,6 +62,14 @@ type SessionResponse struct {
 	// When ?depth=N is supplied, only the last N turns (head + N-1 ancestors)
 	// are returned, still in chronological order.
 	Turns []Turn `json:"turns"`
+
+	// Truncated is true when the ancestry walk stopped at a parent_hash
+	// that could not be resolved in the current store. MissingParent
+	// names that hash. This is an expected edge case on stores that
+	// trim older data, merge foreign content, or offload history to
+	// another source — not an error.
+	Truncated     bool   `json:"truncated,omitempty"`
+	MissingParent string `json:"missing_parent,omitempty"`
 }
 
 // Turn is a single message in a session's chain.
@@ -125,7 +133,7 @@ func (s *Server) handleGetSession(c *fiber.Ctx) error {
 		depth = parsed
 	}
 
-	ancestry, err := s.driver.Ancestry(c.Context(), hash)
+	chain, err := s.driver.AncestryChain(c.Context(), hash)
 	if err != nil {
 		var notFound storage.NotFoundError
 		if errors.As(err, &notFound) {
@@ -135,8 +143,9 @@ func (s *Server) handleGetSession(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(llm.ErrorResponse{Error: "failed to load session"})
 	}
 
-	// Ancestry returns node-first (leaf) then back toward root. Slice to the
-	// requested depth before reversing into chronological order.
+	// AncestryChain returns node-first (leaf) then back toward root. Slice
+	// to the requested depth before reversing into chronological order.
+	ancestry := chain.Nodes
 	total := len(ancestry)
 	slice := ancestry
 	if depth > 0 && depth < total {
@@ -150,9 +159,11 @@ func (s *Server) handleGetSession(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(SessionResponse{
-		Hash:  hash,
-		Depth: total,
-		Turns: turns,
+		Hash:          hash,
+		Depth:         total,
+		Turns:         turns,
+		Truncated:     chain.Incomplete,
+		MissingParent: chain.MissingParent,
 	})
 }
 
