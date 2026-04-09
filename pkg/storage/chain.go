@@ -21,12 +21,28 @@ type Chain struct {
 	// or the last resolvable node whose parent could not be found.
 	Nodes []*merkle.Node
 
-	// Incomplete is true when the walk stopped at a missing parent.
+	// Incomplete is true when the walk stopped short of a real root,
+	// whether because a parent_hash could not be resolved (see
+	// MissingParent) or because a cycle was detected (see CycleDetected).
 	Incomplete bool
 
 	// MissingParent is the parent_hash that could not be resolved in this
-	// store. Only set when Incomplete is true.
+	// store. Only set when Incomplete is true due to a dangling pointer;
+	// left empty for cycle-detected incompletes (the cycle-triggering
+	// hash is present in Nodes already).
 	MissingParent string
+
+	// CycleDetected is true when the walk stopped because it was about
+	// to re-visit a hash already in Nodes. Drivers guard every walk with
+	// a per-chain seen-set so a corrupt parent edge can never spin
+	// forever; when this flag trips, the chain is the largest
+	// acyclic prefix reachable from the starting hash.
+	//
+	// In practice this never trips on a healthy store. It exists because
+	// a single corrupted parent_hash would otherwise hang any endpoint
+	// that walks ancestry, which is a blast radius out of proportion to
+	// the likelihood.
+	CycleDetected bool
 }
 
 // Complete reports whether the walk reached a real root.

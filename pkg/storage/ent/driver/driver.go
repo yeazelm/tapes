@@ -216,8 +216,20 @@ func (ed *EntDriver) AncestryChain(ctx context.Context, hash string) (*storage.C
 		return nil, fmt.Errorf("failed to get node: %w", err)
 	}
 
+	// seen guards the walk against a corrupt parent edge that would
+	// otherwise loop forever. The cost is one map insert + one lookup
+	// per node, on top of a slice we're already building — trivial next
+	// to the per-step SQL query.
+	seen := make(map[string]struct{})
 	chain := &storage.Chain{}
 	for current != nil {
+		if _, loop := seen[current.ID]; loop {
+			chain.Incomplete = true
+			chain.CycleDetected = true
+			break
+		}
+		seen[current.ID] = struct{}{}
+
 		n, err := ed.entNodeToMerkleNode(current)
 		if err != nil {
 			return nil, err
@@ -226,8 +238,6 @@ func (ed *EntDriver) AncestryChain(ctx context.Context, hash string) (*storage.C
 
 		parent, err := current.QueryParent().Only(ctx)
 		if ent.IsNotFound(err) {
-			// Distinguish a real root (no parent_hash) from a dangling
-			// pointer (parent_hash set but referenced node missing).
 			if current.ParentHash != nil && *current.ParentHash != "" {
 				chain.Incomplete = true
 				chain.MissingParent = *current.ParentHash
@@ -242,6 +252,128 @@ func (ed *EntDriver) AncestryChain(ctx context.Context, hash string) (*storage.C
 
 	chain.Nodes = path
 	return chain, nil
+}
+
+// ancestryBatchChunk caps the IN-list size for each batched parent lookup.
+const ancestryBatchChunk = 500
+
+// maxAncestryDepth is a safety rail on the BFS walk.
+const maxAncestryDepth = 50_000
+
+// AncestryChains walks the ancestry of each input hash using a breadth-first
+// batched traversal so the cost scales with max chain depth, not the
+// product of N_starts × depth. Shared ancestors across starts are fetched
+// once per BFS level.
+func (ed *EntDriver) AncestryChains(ctx context.Context, hashes []string) (map[string]*storage.Chain, error) {
+	if len(hashes) == 0 {
+		return map[string]*storage.Chain{}, nil
+	}
+
+	uniqueStarts := dedupeHashes(hashes)
+
+	startNodes, err := ed.getNodesByHashes(ctx, uniqueStarts)
+	if err != nil {
+		return nil, fmt.Errorf("fetch starting nodes: %w", err)
+	}
+
+	chains := make(map[string]*storage.Chain, len(startNodes))
+	pending := make(map[string]string, len(startNodes))
+	perLeafSeen := make(map[string]map[string]struct{}, len(startNodes))
+
+	for hash, n := range startNodes {
+		chains[hash] = &storage.Chain{Nodes: []*merkle.Node{n}}
+		perLeafSeen[hash] = map[string]struct{}{hash: {}}
+		if n.ParentHash != nil && *n.ParentHash != "" {
+			pending[hash] = *n.ParentHash
+		}
+	}
+
+	for depth := 0; len(pending) > 0 && depth < maxAncestryDepth; depth++ {
+		frontier := dedupePendingTargets(pending)
+		parents, err := ed.getNodesByHashes(ctx, frontier)
+		if err != nil {
+			return nil, fmt.Errorf("fetch parents at depth %d: %w", depth, err)
+		}
+
+		nextPending := make(map[string]string, len(pending))
+		for leafHash, parentHash := range pending {
+			parentNode, ok := parents[parentHash]
+			if !ok {
+				chains[leafHash].Incomplete = true
+				chains[leafHash].MissingParent = parentHash
+				continue
+			}
+			if _, seen := perLeafSeen[leafHash][parentHash]; seen {
+				chains[leafHash].Incomplete = true
+				chains[leafHash].CycleDetected = true
+				continue
+			}
+			perLeafSeen[leafHash][parentHash] = struct{}{}
+			chains[leafHash].Nodes = append(chains[leafHash].Nodes, parentNode)
+			if parentNode.ParentHash != nil && *parentNode.ParentHash != "" {
+				nextPending[leafHash] = *parentNode.ParentHash
+			}
+		}
+		pending = nextPending
+	}
+
+	for leafHash, parentHash := range pending {
+		chains[leafHash].Incomplete = true
+		chains[leafHash].MissingParent = parentHash
+	}
+
+	return chains, nil
+}
+
+func (ed *EntDriver) getNodesByHashes(ctx context.Context, hashes []string) (map[string]*merkle.Node, error) {
+	out := make(map[string]*merkle.Node, len(hashes))
+	for start := 0; start < len(hashes); start += ancestryBatchChunk {
+		end := start + ancestryBatchChunk
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		chunk := hashes[start:end]
+		entNodes, err := ed.Client.Node.Query().
+			Where(node.IDIn(chunk...)).
+			All(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, en := range entNodes {
+			n, err := ed.entNodeToMerkleNode(en)
+			if err != nil {
+				return nil, err
+			}
+			out[en.ID] = n
+		}
+	}
+	return out, nil
+}
+
+func dedupeHashes(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, h := range in {
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	return out
+}
+
+func dedupePendingTargets(pending map[string]string) []string {
+	seen := make(map[string]struct{}, len(pending))
+	out := make([]string, 0, len(pending))
+	for _, target := range pending {
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		out = append(out, target)
+	}
+	return out
 }
 
 // Depth returns the depth of a node (0 for roots).

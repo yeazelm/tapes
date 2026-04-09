@@ -33,6 +33,14 @@ var _ = storagetest.RunAncestryChainBasicSpecs("sqlite", func() storage.Driver {
 	return d
 })
 
+var _ = storagetest.RunAncestryChainsSpecs("sqlite", func() storage.Driver {
+	ctx := context.Background()
+	d, err := sqlite.NewDriver(ctx, ":memory:")
+	Expect(err).NotTo(HaveOccurred())
+	Expect(d.Migrate(ctx)).To(Succeed())
+	return d
+})
+
 // sqliteTestBucket creates a simple bucket for testing with the given text content
 func sqliteTestBucket(text string) merkle.Bucket {
 	return merkle.Bucket{
@@ -504,6 +512,13 @@ var _ = Describe("Driver", func() {
 })
 
 var _ = Describe("AncestryChain dangling parents [sqlite]", func() {
+	// These specs exercise the same path as the shared dangling conformance
+	// suite, but have to bypass referential integrity to set up the
+	// scenario because the sqlite driver enables _foreign_keys=on. The
+	// real dangling rows observed in production came from bulk imports
+	// that wrote directly to the table with FKs disabled, so we mirror
+	// that by injecting rows over a second FK-off sql.DB handle to the
+	// same file.
 	var (
 		ctx     context.Context
 		driver  *sqlite.Driver
@@ -562,6 +577,7 @@ var _ = Describe("AncestryChain dangling parents [sqlite]", func() {
 		Expect(chain.Incomplete).To(BeTrue())
 		Expect(chain.MissingParent).To(Equal(phantom))
 		Expect(chain.Complete()).To(BeFalse())
+		// Node-first order: child first, orphan (last resolvable) at tail.
 		Expect(chain.Nodes[0].Hash).To(Equal(childHash))
 		Expect(chain.Nodes[1].Hash).To(Equal(orphanHash))
 	})
@@ -586,5 +602,37 @@ var _ = Describe("AncestryChain dangling parents [sqlite]", func() {
 		nodes, err := driver.Ancestry(ctx, orphanHash)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(nodes).To(HaveLen(1))
+	})
+
+	It("stops a two-node cycle in AncestryChain instead of looping", func() {
+		hashA := "eeee000000000000000000000000000000000000000000000000000000000000"
+		hashB := "ffff000000000000000000000000000000000000000000000000000000000000"
+		// A → B → A. Neither can be inserted via Put (content addressing
+		// forbids the pair, and the FK rejects it anyway), so we drop
+		// the rows in directly over the FK-off handle.
+		insertOrphan(hashA, hashB)
+		insertOrphan(hashB, hashA)
+
+		chain, err := driver.AncestryChain(ctx, hashA)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chain.Nodes).To(HaveLen(2))
+		Expect(chain.Incomplete).To(BeTrue())
+		Expect(chain.CycleDetected).To(BeTrue())
+		Expect(chain.MissingParent).To(BeEmpty())
+	})
+
+	It("stops a cycle in the batched AncestryChains path", func() {
+		hashA := "aaaacccc00000000000000000000000000000000000000000000000000000000"
+		hashB := "bbbbcccc00000000000000000000000000000000000000000000000000000000"
+		insertOrphan(hashA, hashB)
+		insertOrphan(hashB, hashA)
+
+		chains, err := driver.AncestryChains(ctx, []string{hashA})
+		Expect(err).NotTo(HaveOccurred())
+		cycleChain := chains[hashA]
+		Expect(cycleChain).NotTo(BeNil())
+		Expect(cycleChain.Incomplete).To(BeTrue())
+		Expect(cycleChain.CycleDetected).To(BeTrue())
+		Expect(cycleChain.Nodes).To(HaveLen(2))
 	})
 })

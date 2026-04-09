@@ -153,34 +153,64 @@ func (s *Driver) Ancestry(ctx context.Context, hash string) ([]*merkle.Node, err
 }
 
 // AncestryChain walks the parent chain starting at hash and returns a Chain
-// describing whether the walk reached a real root or stopped at a parent
-// that is not present in this store.
+// describing whether the walk reached a real root, stopped at a parent that
+// is not present in this store, or was guarded out of a cycle.
 func (s *Driver) AncestryChain(ctx context.Context, hash string) (*storage.Chain, error) {
 	node, err := s.Get(ctx, hash)
 	if err != nil {
 		return nil, fmt.Errorf("getting node %s: %w", hash, err)
 	}
 
+	seen := map[string]struct{}{node.Hash: {}}
 	chain := &storage.Chain{Nodes: []*merkle.Node{node}}
 	for {
 		if node.ParentHash == nil || *node.ParentHash == "" {
+			return chain, nil
+		}
+		if _, loop := seen[*node.ParentHash]; loop {
+			chain.Incomplete = true
+			chain.CycleDetected = true
 			return chain, nil
 		}
 		parent, err := s.Get(ctx, *node.ParentHash)
 		if err != nil {
 			var notFound storage.NotFoundError
 			if errors.As(err, &notFound) {
-				// Parent pointer exists but the target is missing —
-				// treat as an expected partial-chain condition.
 				chain.Incomplete = true
 				chain.MissingParent = *node.ParentHash
 				return chain, nil
 			}
 			return nil, fmt.Errorf("getting node %s: %w", *node.ParentHash, err)
 		}
+		seen[parent.Hash] = struct{}{}
 		chain.Nodes = append(chain.Nodes, parent)
 		node = parent
 	}
+}
+
+// AncestryChains walks each input hash's ancestry and returns a Chain per
+// starting hash. The in-memory driver has O(1) Get, so the batched ent
+// fast path offers no benefit here — this is a straightforward loop over
+// AncestryChain.
+func (s *Driver) AncestryChains(ctx context.Context, hashes []string) (map[string]*storage.Chain, error) {
+	out := make(map[string]*storage.Chain, len(hashes))
+	seen := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		chain, err := s.AncestryChain(ctx, h)
+		if err != nil {
+			var notFound storage.NotFoundError
+			if errors.As(err, &notFound) {
+				continue
+			}
+			return nil, err
+		}
+		out[h] = chain
+	}
+	return out, nil
 }
 
 // Depth returns the depth of a node (0 for roots).

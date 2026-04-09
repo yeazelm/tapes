@@ -57,6 +57,22 @@ type Driver interface {
 	// merge content from foreign sources, and is not an error.
 	AncestryChain(ctx context.Context, hash string) (*Chain, error)
 
+	// AncestryChains returns a Chain for each input hash, batched per depth
+	// level so the cost scales with maximum chain depth rather than the
+	// product of starting-node count and depth. Shared ancestors across
+	// starts are fetched once.
+	//
+	// The returned map is keyed by each starting hash. Starts that are not
+	// present in the store are omitted from the map rather than surfaced as
+	// errors — callers that need a strict "every start must resolve" check
+	// should compare the map's keys against their input slice.
+	//
+	// Use this instead of looping over AncestryChain when walking many
+	// leaves (e.g. the /v1/sessions/summary handler): the per-leaf loop
+	// issues O(N_starts × depth) queries, which on a real store with tens
+	// of thousands of leaves will not complete in any reasonable time.
+	AncestryChains(ctx context.Context, hashes []string) (map[string]*Chain, error)
+
 	// Depth returns the depth of a node (0 for roots).
 	Depth(ctx context.Context, hash string) (int, error)
 

@@ -32,18 +32,26 @@ func (s *Server) handleListSessionsSummary(c *fiber.Ctx) error {
 		pricing = sessions.DefaultPricing()
 	}
 
+	// Batch-walk the ancestry of every leaf on the page in a single call.
+	// The naive per-leaf AncestryChain loop issues O(N × depth) queries,
+	// which on a real store with tens of thousands of leaves never
+	// completes. AncestryChains does one batched query per BFS depth
+	// level instead.
+	leafHashes := make([]string, len(page.Items))
+	for i, leaf := range page.Items {
+		leafHashes[i] = leaf.Hash
+	}
+	chainsByHash, err := s.driver.AncestryChains(c.Context(), leafHashes)
+	if err != nil {
+		s.logger.Error("walk ancestry chains", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(llm.ErrorResponse{Error: "failed to load sessions"})
+	}
+
 	items := make([]sessions.SessionSummary, 0, len(page.Items))
 	for _, leaf := range page.Items {
-		// AncestryChain returns node-first and carries a marker when the
-		// walk stopped at a parent that's missing from this store. We
-		// reverse for chronological order before calling BuildSummary
-		// and then stamp the marker onto the returned summary.
-		chain, err := s.driver.AncestryChain(c.Context(), leaf.Hash)
-		if err != nil {
-			s.logger.Warn("failed to walk ancestry for summary",
-				"hash", leaf.Hash,
-				"error", err,
-			)
+		chain, ok := chainsByHash[leaf.Hash]
+		if !ok {
+			s.logger.Warn("missing chain for leaf", "hash", leaf.Hash)
 			continue
 		}
 		chronological := reverseNodes(chain.Nodes)

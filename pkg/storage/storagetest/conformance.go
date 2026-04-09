@@ -326,6 +326,106 @@ func RunAncestryChainDanglingSpecs(label string, makeDriver DriverFactory) bool 
 	})
 }
 
+// RunAncestryChainsSpecs exercises the batched AncestryChains path against
+// the driver returned by makeDriver.
+func RunAncestryChainsSpecs(label string, makeDriver DriverFactory) bool {
+	return ginkgo.Describe("AncestryChains ["+label+"]", func() {
+		var (
+			ctx    context.Context
+			driver storage.Driver
+		)
+
+		ginkgo.BeforeEach(func() {
+			ctx = context.Background()
+			driver = makeDriver()
+		})
+
+		ginkgo.AfterEach(func() {
+			if driver != nil {
+				_ = driver.Close()
+			}
+		})
+
+		base := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+		ginkgo.It("returns an empty map for an empty input slice", func() {
+			chains, err := driver.AncestryChains(ctx, nil)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chains).To(gomega.BeEmpty())
+		})
+
+		ginkgo.It("walks multiple leaves sharing a root in one call", func() {
+			root := makeNode("shared-root", nil, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, root)
+			leafA := makeNode("leaf-a", &root.Hash, base.Add(time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, leafA)
+			leafB := makeNode("leaf-b", &root.Hash, base.Add(2*time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, leafB)
+
+			chains, err := driver.AncestryChains(ctx, []string{leafA.Hash, leafB.Hash})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chains).To(gomega.HaveLen(2))
+
+			chainA := chains[leafA.Hash]
+			gomega.Expect(chainA).NotTo(gomega.BeNil())
+			gomega.Expect(chainA.Nodes).To(gomega.HaveLen(2))
+			gomega.Expect(chainA.Incomplete).To(gomega.BeFalse())
+			gomega.Expect(chainA.Nodes[0].Hash).To(gomega.Equal(leafA.Hash))
+			gomega.Expect(chainA.Nodes[1].Hash).To(gomega.Equal(root.Hash))
+
+			chainB := chains[leafB.Hash]
+			gomega.Expect(chainB).NotTo(gomega.BeNil())
+			gomega.Expect(chainB.Nodes).To(gomega.HaveLen(2))
+			gomega.Expect(chainB.Nodes[0].Hash).To(gomega.Equal(leafB.Hash))
+			gomega.Expect(chainB.Nodes[1].Hash).To(gomega.Equal(root.Hash))
+		})
+
+		ginkgo.It("walks chains of different depths in the same batch", func() {
+			root := makeNode("deep-root", nil, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, root)
+			mid := makeNode("deep-mid", &root.Hash, base.Add(time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, mid)
+			deepLeaf := makeNode("deep-leaf", &mid.Hash, base.Add(2*time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, deepLeaf)
+
+			shallowRoot := makeNode("shallow-root", nil, base.Add(3*time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, shallowRoot)
+			shallowLeaf := makeNode("shallow-leaf", &shallowRoot.Hash, base.Add(4*time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, shallowLeaf)
+
+			chains, err := driver.AncestryChains(ctx, []string{deepLeaf.Hash, shallowLeaf.Hash})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chains[deepLeaf.Hash].Nodes).To(gomega.HaveLen(3))
+			gomega.Expect(chains[deepLeaf.Hash].Incomplete).To(gomega.BeFalse())
+			gomega.Expect(chains[shallowLeaf.Hash].Nodes).To(gomega.HaveLen(2))
+			gomega.Expect(chains[shallowLeaf.Hash].Incomplete).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("dedupes duplicate input hashes", func() {
+			root := makeNode("dup-root", nil, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, root)
+			leaf := makeNode("dup-leaf", &root.Hash, base.Add(time.Second), "tapes", "claude", "m", "p")
+			putWith(ctx, driver, leaf)
+
+			chains, err := driver.AncestryChains(ctx, []string{leaf.Hash, leaf.Hash, leaf.Hash})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chains).To(gomega.HaveLen(1))
+			gomega.Expect(chains[leaf.Hash].Nodes).To(gomega.HaveLen(2))
+		})
+
+		ginkgo.It("omits unknown input hashes from the map", func() {
+			root := makeNode("real-root", nil, base, "tapes", "claude", "m", "p")
+			putWith(ctx, driver, root)
+
+			chains, err := driver.AncestryChains(ctx, []string{root.Hash, "does-not-exist"})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(chains).To(gomega.HaveLen(1))
+			gomega.Expect(chains).To(gomega.HaveKey(root.Hash))
+			gomega.Expect(chains).NotTo(gomega.HaveKey("does-not-exist"))
+		})
+	})
+}
+
 func putWith(ctx context.Context, d storage.Driver, n *merkle.Node) {
 	_, err := d.Put(ctx, n)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
