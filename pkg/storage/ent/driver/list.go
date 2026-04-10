@@ -122,6 +122,26 @@ func buildFilterPredicates(opts storage.ListOpts) []predicate.Node {
 	return preds
 }
 
+// ListParentRefs returns the (hash, parent_hash) tuple for every node in the
+// store. It projects only the two edge columns so integrity checks over large
+// databases don't pay the cost of deserializing every node's bucket JSON.
+func (ed *EntDriver) ListParentRefs(ctx context.Context) ([]storage.ParentRef, error) {
+	var rows []struct {
+		Hash       string  `sql:"hash"`
+		ParentHash *string `sql:"parent_hash"`
+	}
+	if err := ed.Client.Node.Query().
+		Select(node.FieldID, node.FieldParentHash).
+		Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("failed to scan parent refs: %w", err)
+	}
+	refs := make([]storage.ParentRef, len(rows))
+	for i, r := range rows {
+		refs[i] = storage.ParentRef{Hash: r.Hash, ParentHash: r.ParentHash}
+	}
+	return refs, nil
+}
+
 // keysetBefore returns a predicate matching rows that come strictly after the
 // cursor in (created_at DESC, hash DESC) order — i.e. rows with an earlier
 // created_at, or with the same created_at and a smaller hash.
