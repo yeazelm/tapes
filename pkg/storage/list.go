@@ -11,9 +11,23 @@ import (
 // DefaultListLimit is the page size used when ListOpts.Limit is zero.
 const DefaultListLimit = 50
 
-// MaxListLimit is the maximum permitted page size.
-// Drivers will clamp ListOpts.Limit to this value.
-const MaxListLimit = 200
+// MaxListLimit is the maximum permitted page size. Drivers clamp
+// ListOpts.Limit to this value.
+//
+// Set high (5000) because the AncestryChains hot path has a large
+// fixed cost per request (the recursive CTE setup) and a tiny
+// incremental cost per leaf — measured at ~260ms regardless of
+// whether limit is 200 or 1000 against the brian_large store. Forcing
+// callers to paginate at small page sizes multiplies the fixed cost.
+// The deck's full Overview load drops from ~17s @ limit=200 (50 round
+// trips) to ~3s @ limit=2000 (5 round trips) just from the math.
+//
+// Memory impact: each row carries ~200 bytes (the CTE doesn't ship
+// the heavy `content` blob — see the label_hint extraction in
+// pkg/storage/ent/driver/driver.go). 5000 leaves × ~30 avg depth
+// × 200 bytes ≈ 30 MB peak per request, which is fine for an API
+// server backing one deck instance.
+const MaxListLimit = 5000
 
 // ListOpts controls filtering and cursor pagination for session listings.
 //

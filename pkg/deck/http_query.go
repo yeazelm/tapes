@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,8 +19,13 @@ import (
 )
 
 const (
-	httpQueryTimeout    = 30 * time.Second
-	httpQueryPageLimit  = 200
+	httpQueryTimeout = 30 * time.Second
+	// httpQueryPageLimit is sized to ride the AncestryChains fixed-cost
+	// floor: each /v1/sessions/summary call costs ~260ms regardless of
+	// page size on a real store, so smaller pages just multiply the
+	// total round-trip count for no per-row savings. 2000 is a safe
+	// page size for the bumped storage.MaxListLimit (5000).
+	httpQueryPageLimit  = 2000
 	httpQueryMaxSummary = 10000 // safety cap on total sessions paged through
 )
 
@@ -240,6 +247,10 @@ func (q *HTTPQuery) fetchAllSummaries(ctx context.Context, filters Filters) ([]S
 			break
 		}
 		if len(all) >= httpQueryMaxSummary {
+			slog.Warn("session summary cap reached; overview may be incomplete",
+				"cap", httpQueryMaxSummary,
+				"fetched", len(all),
+			)
 			break
 		}
 		cursor = page.NextCursor
@@ -443,22 +454,15 @@ func tokensForTurn(t httpTurn) sessions.NodeTokens {
 // sortTurnsByTime sorts turns in place by CreatedAt, then by hash for stable
 // ordering when timestamps are equal.
 func sortTurnsByTime(turns []httpTurn) {
-	if len(turns) < 2 {
-		return
-	}
-	// Stable insertion sort is fine here; merged groups are typically small.
-	for i := 1; i < len(turns); i++ {
-		for j := i; j > 0 && turnLess(turns[j], turns[j-1]); j-- {
-			turns[j], turns[j-1] = turns[j-1], turns[j]
+	slices.SortStableFunc(turns, func(a, b httpTurn) int {
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			if a.CreatedAt.Before(b.CreatedAt) {
+				return -1
+			}
+			return 1
 		}
-	}
-}
-
-func turnLess(a, b httpTurn) bool {
-	if !a.CreatedAt.Equal(b.CreatedAt) {
-		return a.CreatedAt.Before(b.CreatedAt)
-	}
-	return a.Hash < b.Hash
+		return strings.Compare(a.Hash, b.Hash)
+	})
 }
 
 // ErrEmptyChain is returned when SessionDetail receives an empty chain back
