@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -182,10 +183,10 @@ func (c *checkoutCommander) run() error {
 
 // fetchSession calls the API to get the session chain for a given hash.
 func (c *checkoutCommander) fetchSession(hash string) (*sessionResponse, error) {
-	url := fmt.Sprintf("%s/v1/sessions/%s", c.apiTarget, hash)
+	endpoint := fmt.Sprintf("%s/v1/sessions/%s", c.apiTarget, url.PathEscape(hash))
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
