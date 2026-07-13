@@ -151,7 +151,28 @@ func ClassifyCall(req *llm.ChatRequest, resp *llm.ChatResponse) string {
 		return KindMain
 	}
 
+	// GPT-5.6 Codex spine: the request carries NO client-side tool
+	// definitions (the ChatGPT Codex backend injects them server-side)
+	// but still declares tool routing. A streaming Responses call with
+	// tool_choice set is the conversation spine — tool-less shadow
+	// calls (title-gen, plan-name) send neither.
+	if streaming && responsesToolChoice(req) {
+		return KindMain
+	}
+
 	return KindUnknown
+}
+
+// responsesToolChoice reports whether a Responses API request declared
+// tool routing via tool_choice. The parser stores both markers in
+// Extra (see parseResponsesRequest); presence is the tell, the value
+// is irrelevant.
+func responsesToolChoice(req *llm.ChatRequest) bool {
+	if req.Extra == nil || req.Extra["endpoint"] != "responses" {
+		return false
+	}
+	_, ok := req.Extra["tool_choice"]
+	return ok
 }
 
 // ClassifyInjected reports the injected-context kind for one request
